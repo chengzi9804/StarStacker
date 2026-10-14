@@ -146,7 +146,7 @@ final class StackEngine {
         )
         enc2.endEncoding()
 
-        await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             cb2.addCompletedHandler { _ in cont.resume() }
             cb2.commit()
         }
