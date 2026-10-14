@@ -10,6 +10,11 @@ enum StackError: Error {
     case shaderNotFound(String)
 }
 
+enum StackMode: String {
+    case star = "星空堆栈"
+    case highPixel = "高像素堆栈"
+}
+
 final class StackEngine {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -36,6 +41,7 @@ final class StackEngine {
         images: [CGImage],
         sigma: Float,
         align: Bool,
+        mode: StackMode,
         onProgress: @escaping (Double) -> Void
     ) async throws -> CGImage {
         guard let first = images.first else {
@@ -111,11 +117,6 @@ final class StackEngine {
         }
 
         // 4. Output pass
-        guard let sigmaFunc = library.makeFunction(name: "sigmaClipOutput") else {
-            throw StackError.shaderNotFound("sigmaClipOutput")
-        }
-        let sigmaPSO = try await device.makeComputePipelineState(function: sigmaFunc)
-
         let outDesc = MTLTextureDescriptor()
         outDesc.pixelFormat = .rgba8Unorm
         outDesc.width = width
@@ -125,32 +126,113 @@ final class StackEngine {
             throw StackError.textureCreationFailed
         }
 
-        guard let cb2 = commandQueue.makeCommandBuffer(),
-              let enc2 = cb2.makeComputeCommandEncoder() else {
-            throw StackError.pipelineCreationFailed
+        switch mode {
+        case .star:
+            guard let sigmaFunc = library.makeFunction(name: "sigmaClipOutput") else {
+                throw StackError.shaderNotFound("sigmaClipOutput")
+            }
+            let sigmaPSO = try await device.makeComputePipelineState(function: sigmaFunc)
+
+            guard let cb2 = commandQueue.makeCommandBuffer(),
+                  let enc2 = cb2.makeComputeCommandEncoder() else {
+                throw StackError.pipelineCreationFailed
+            }
+
+            var sigmaVal = sigma
+            enc2.setComputePipelineState(sigmaPSO)
+            enc2.setTexture(sumTex, index: 0)
+            enc2.setTexture(sumSqTex, index: 1)
+            enc2.setTexture(countTex, index: 2)
+            enc2.setTexture(outTex, index: 3)
+            enc2.setBytes(&sigmaVal, length: MemoryLayout<Float>.stride, index: 0)
+
+            let tgW2 = sigmaPSO.threadExecutionWidth
+            let tgH2 = max(1, sigmaPSO.maxTotalThreadsPerThreadgroup / tgW2)
+            enc2.dispatchThreads(
+                MTLSize(width: width, height: height, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgW2, height: tgH2, depth: 1)
+            )
+            enc2.endEncoding()
+
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                cb2.addCompletedHandler { _ in cont.resume() }
+                cb2.commit()
+            }
+
+        case .highPixel:
+            // 4a. Clean average
+            guard let avgFunc = library.makeFunction(name: "averageOutput") else {
+                throw StackError.shaderNotFound("averageOutput")
+            }
+            let avgPSO = try await device.makeComputePipelineState(function: avgFunc)
+
+            guard let cbAvg = commandQueue.makeCommandBuffer(),
+                  let encAvg = cbAvg.makeComputeCommandEncoder() else {
+                throw StackError.pipelineCreationFailed
+            }
+            encAvg.setComputePipelineState(avgPSO)
+            encAvg.setTexture(sumTex, index: 0)
+            encAvg.setTexture(sumSqTex, index: 1)
+            encAvg.setTexture(countTex, index: 2)
+            encAvg.setTexture(outTex, index: 3)
+
+            let tgW = avgPSO.threadExecutionWidth
+            let tgH = max(1, avgPSO.maxTotalThreadsPerThreadgroup / tgW)
+            encAvg.dispatchThreads(
+                MTLSize(width: width, height: height, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1)
+            )
+            encAvg.endEncoding()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                cbAvg.addCompletedHandler { _ in cont.resume() }
+                cbAvg.commit()
+            }
+
+            onProgress(0.92)
+
+            // 4b. Unsharp mask sharpening
+            guard let sharpFunc = library.makeFunction(name: "sharpenOutput") else {
+                throw StackError.shaderNotFound("sharpenOutput")
+            }
+            let sharpPSO = try await device.makeComputePipelineState(function: sharpFunc)
+
+            let sharpDesc = MTLTextureDescriptor()
+            sharpDesc.pixelFormat = .rgba8Unorm
+            sharpDesc.width = width
+            sharpDesc.height = height
+            sharpDesc.usage = [.shaderRead, .shaderWrite]
+            guard let sharpTex = device.makeTexture(descriptor: sharpDesc) else {
+                throw StackError.textureCreationFailed
+            }
+
+            guard let cbSharp = commandQueue.makeCommandBuffer(),
+                  let encSharp = cbSharp.makeComputeCommandEncoder() else {
+                throw StackError.pipelineCreationFailed
+            }
+            var amount: Float = 0.35
+            encSharp.setComputePipelineState(sharpPSO)
+            encSharp.setTexture(outTex, index: 0)
+            encSharp.setTexture(sharpTex, index: 1)
+            encSharp.setBytes(&amount, length: MemoryLayout<Float>.stride, index: 0)
+
+            let tgWs = sharpPSO.threadExecutionWidth
+            let tgHs = max(1, sharpPSO.maxTotalThreadsPerThreadgroup / tgWs)
+            encSharp.dispatchThreads(
+                MTLSize(width: width, height: height, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWs, height: tgHs, depth: 1)
+            )
+            encSharp.endEncoding()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                cbSharp.addCompletedHandler { _ in cont.resume() }
+                cbSharp.commit()
+            }
+
+            // Return sharpened result directly
+            onProgress(0.96)
+            return try cgImage(from: sharpTex)
         }
 
-        var sigmaVal = sigma
-        enc2.setComputePipelineState(sigmaPSO)
-        enc2.setTexture(sumTex, index: 0)
-        enc2.setTexture(sumSqTex, index: 1)
-        enc2.setTexture(countTex, index: 2)
-        enc2.setTexture(outTex, index: 3)
-        enc2.setBytes(&sigmaVal, length: MemoryLayout<Float>.stride, index: 0)
-
-        let tgW2 = sigmaPSO.threadExecutionWidth
-        let tgH2 = max(1, sigmaPSO.maxTotalThreadsPerThreadgroup / tgW2)
-        enc2.dispatchThreads(
-            MTLSize(width: width, height: height, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: tgW2, height: tgH2, depth: 1)
-        )
-        enc2.endEncoding()
-
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            cb2.addCompletedHandler { _ in cont.resume() }
-            cb2.commit()
-        }
-        onProgress(0.9)
+        onProgress(0.95)
 
         return try cgImage(from: outTex)
     }

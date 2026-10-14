@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var progress: Double = 0
     @State private var sigmaClipThreshold: Double = 2.0
     @State private var useAlignment: Bool = true
+    @State private var stackMode: StackMode = .star
     @State private var errorMessage: String?
 
     var body: some View {
@@ -21,14 +22,24 @@ struct ContentView: View {
                 VStack(spacing: 20) {
                     headerView
 
+                    Picker("堆栈模式", selection: $stackMode) {
+                        ForEach([StackMode.star, .highPixel], id: \.self) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
                     PhotosPicker(selection: $selectedItems, maxSelectionCount: 60, matching: .images) {
-                        Label("选择星空照片 (最多60张)", systemImage: "photo.badge.plus")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(.blue.gradient)
-                            .foregroundColor(.white)
-                            .cornerRadius(12)
+                        Label(
+                            stackMode == .star ? "选择星空照片 (最多60张)" : "选择同场景照片 (最多60张)",
+                            systemImage: "photo.badge.plus"
+                        )
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(stackMode == .star ? .indigo.gradient : .blue.gradient)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
                     }
 
                     if isLoadingPhotos {
@@ -54,7 +65,8 @@ struct ContentView: View {
                             }
                             .frame(maxWidth: .infinity)
                         } else {
-                            Label("开始 Sigma-Clip 堆栈", systemImage: "wand.and.stars")
+                            Label(stackMode == .star ? "开始 Sigma-Clip 堆栈" : "开始高像素堆栈",
+                                  systemImage: stackMode == .star ? "wand.and.stars" : "sparkle.magnifyingglass")
                                 .frame(maxWidth: .infinity)
                         }
                     }
@@ -77,12 +89,14 @@ struct ContentView: View {
 
     private var headerView: some View {
         VStack(spacing: 4) {
-            Image(systemName: "moon.stars.fill")
+            Image(systemName: stackMode == .star ? "moon.stars.fill" : "camera.metering.multiple")
                 .font(.system(size: 40))
-                .foregroundColor(.indigo)
-            Text("星空像素堆栈")
+                .foregroundColor(stackMode == .star ? .indigo : .blue)
+            Text(stackMode == .star ? "星空像素堆栈" : "高像素堆栈")
                 .font(.title2.bold())
-            Text("Sigma-Clip 降噪 · 多帧对齐 · Metal GPU加速")
+            Text(stackMode == .star
+                 ? "Sigma-Clip 降噪 · 星点对齐 · Metal GPU加速"
+                 : "多帧平均降噪 · 锐化增强 · 放大更清晰")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -91,15 +105,27 @@ struct ContentView: View {
 
     private var settingsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Sigma 阈值")
-                Spacer()
-                Text(String(format: "%.1fσ", sigmaClipThreshold))
-                    .foregroundColor(.blue)
-            }
-            Slider(value: $sigmaClipThreshold, in: 1.0...5.0, step: 0.5)
+            if stackMode == .star {
+                HStack {
+                    Text("Sigma 阈值")
+                    Spacer()
+                    Text(String(format: "%.1fσ", sigmaClipThreshold))
+                        .foregroundColor(.blue)
+                }
+                Slider(value: $sigmaClipThreshold, in: 1.0...5.0, step: 0.5)
 
-            Toggle("启用星点对齐", isOn: $useAlignment)
+                Toggle("启用星点对齐", isOn: $useAlignment)
+            } else {
+                HStack {
+                    Text("帧对齐")
+                    Spacer()
+                    Text("自动")
+                        .foregroundColor(.secondary)
+                }
+                Text("多张同场景照片自动对齐后平均，降噪量 ≈ √N，再叠加 USM 锐化，放大后细节更清晰。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
         .padding()
         .background(.gray.opacity(0.1))
@@ -157,6 +183,7 @@ struct ContentView: View {
                     images: sourceImages,
                     sigma: Float(sigmaClipThreshold),
                     align: useAlignment,
+                    mode: stackMode,
                     onProgress: { p in
                         DispatchQueue.main.async { self.progress = p }
                     }
