@@ -209,7 +209,7 @@ final class StackEngine {
                   let encSharp = cbSharp.makeComputeCommandEncoder() else {
                 throw StackError.pipelineCreationFailed
             }
-            var amount: Float = 0.35
+            var amount: Float = 0.15
             encSharp.setComputePipelineState(sharpPSO)
             encSharp.setTexture(outTex, index: 0)
             encSharp.setTexture(sharpTex, index: 1)
@@ -262,72 +262,88 @@ final class StackEngine {
         resultDesc.usage = [.shaderRead, .shaderWrite]
 
         var shifts: [SIMD2<Float>] = [.zero]
-        let searchRange = 2  // ±2 px on downscaled = ±16 px on full res
+        let searchRange = 4  // ±4 px on /8 grid = ±32 px full res
 
         for otherIdx in 0..<smallOthers.count {
             let smallOther = smallOthers[otherIdx]
-            var bestShift = SIMD2<Float>(0, 0)
+            var bestShiftSmall = SIMD2<Float>(0, 0)
             var bestSSD: Float = .greatestFiniteMagnitude
 
+            // Helper: run SSD for a given shift on small image, return average SSD
+            func avgSSD(for shiftSmall: SIMD2<Float>) async throws -> Float {
+                guard let cb = commandQueue.makeCommandBuffer(),
+                      let enc = cb.makeComputeCommandEncoder(),
+                      let resultTex = device.makeTexture(descriptor: resultDesc) else {
+                    throw StackError.pipelineCreationFailed
+                }
+                var s = shiftSmall
+                enc.setComputePipelineState(ssdPSO)
+                enc.setTexture(smallRef, index: 0)
+                enc.setTexture(smallOther, index: 1)
+                enc.setTexture(resultTex, index: 2)
+                enc.setBytes(&s, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+
+                let tgW = ssdPSO.threadExecutionWidth
+                let tgH = max(1, ssdPSO.maxTotalThreadsPerThreadgroup / tgW)
+                enc.dispatchThreads(
+                    MTLSize(width: smallW, height: smallH, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1)
+                )
+                enc.endEncoding()
+                cb.commit()
+                await cb.waitUntilCompleted()
+
+                let ssdBytesPerRow = smallW * 4
+                let ssdData = UnsafeMutableRawPointer.allocate(
+                    byteCount: ssdBytesPerRow * smallH, alignment: 16
+                )
+                defer { ssdData.deallocate() }
+                resultTex.getBytes(
+                    ssdData, bytesPerRow: ssdBytesPerRow,
+                    from: MTLRegionMake2D(0, 0, smallW, smallH),
+                    mipmapLevel: 0
+                )
+                var sumSSD: Float = 0
+                var n: Float = 0
+                let ptr = ssdData.bindMemory(to: Float.self, capacity: smallW * smallH)
+                for y in 0..<smallH {
+                    for x in 0..<smallW {
+                        let v = ptr[y * smallW + x]
+                        if v > 0 { sumSSD += v; n += 1 }
+                    }
+                }
+                return n > 0 ? sumSSD / n : .greatestFiniteMagnitude
+            }
+
+            // Coarse integer search on downscaled image
             for dy in -searchRange...searchRange {
                 for dx in -searchRange...searchRange {
-                    guard let cb = commandQueue.makeCommandBuffer(),
-                          let enc = cb.makeComputeCommandEncoder(),
-                          let resultTex = device.makeTexture(descriptor: resultDesc) else {
-                        throw StackError.pipelineCreationFailed
-                    }
-
-                    var shift = SIMD2<Float>(Float(dx), Float(dy))
-                    enc.setComputePipelineState(ssdPSO)
-                    enc.setTexture(smallRef, index: 0)
-                    enc.setTexture(smallOther, index: 1)
-                    enc.setTexture(resultTex, index: 2)
-                    enc.setBytes(&shift, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
-
-                    let tgW = ssdPSO.threadExecutionWidth
-                    let tgH = max(1, ssdPSO.maxTotalThreadsPerThreadgroup / tgW)
-                    enc.dispatchThreads(
-                        MTLSize(width: smallW, height: smallH, depth: 1),
-                        threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1)
-                    )
-                    enc.endEncoding()
-                    cb.commit()
-                    await cb.waitUntilCompleted()
-
-                    // Read per-pixel SSD and average
-                    let ssdBytesPerRow = smallW * 4  // r32Float = 4 bytes per pixel
-                    let ssdData = UnsafeMutableRawPointer.allocate(
-                        byteCount: ssdBytesPerRow * smallH, alignment: 16
-                    )
-                    defer { ssdData.deallocate() }
-                    resultTex.getBytes(
-                        ssdData, bytesPerRow: ssdBytesPerRow,
-                        from: MTLRegionMake2D(0, 0, smallW, smallH),
-                        mipmapLevel: 0
-                    )
-
-                    var sumSSD: Float = 0
-                    var count: Float = 0
-                    let ptr = ssdData.bindMemory(to: Float.self, capacity: smallW * smallH)
-                    for y in 0..<smallH {
-                        for x in 0..<smallW {
-                            let v = ptr[y * smallW + x]
-                            if v > 0 {
-                                sumSSD += v
-                                count += 1
-                            }
-                        }
-                    }
-                    let avgSSD = count > 0 ? sumSSD / count : .greatestFiniteMagnitude
-
-                    if avgSSD < bestSSD {
-                        bestSSD = avgSSD
-                        bestShift = SIMD2<Float>(Float(dx) * Float(alignScale),
-                                                  Float(dy) * Float(alignScale))
+                    let s = SIMD2<Float>(Float(dx), Float(dy))
+                    let ssd = try await avgSSD(for: s)
+                    if ssd < bestSSD {
+                        bestSSD = ssd
+                        bestShiftSmall = s
                     }
                 }
             }
-            shifts.append(bestShift)
+
+            // Sub-pixel refinement: try ±0.25 around best
+            let offsets: [Float] = [-0.5, -0.25, 0.25, 0.5]
+            for ox in offsets {
+                for oy in offsets {
+                    let s = SIMD2<Float>(bestShiftSmall.x + ox, bestShiftSmall.y + oy)
+                    let ssd = try await avgSSD(for: s)
+                    if ssd < bestSSD {
+                        bestSSD = ssd
+                        bestShiftSmall = s
+                    }
+                }
+            }
+
+            // Scale back to full resolution (float, sub-pixel)
+            let fullShift = SIMD2<Float>(bestShiftSmall.x * Float(alignScale),
+                                         bestShiftSmall.y * Float(alignScale))
+            shifts.append(fullShift)
         }
         return shifts
     }
