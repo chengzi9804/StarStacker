@@ -19,66 +19,7 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 20) {
-                    headerView
-
-                    Picker("堆栈模式", selection: $stackMode) {
-                        ForEach([StackMode.star, .highPixel], id: \.self) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    PhotosPicker(selection: $selectedItems, maxSelectionCount: 60, matching: .images) {
-                        Label(
-                            stackMode == .star ? "选择星空照片 (最多60张)" : "选择同场景照片 (最多60张)",
-                            systemImage: "photo.badge.plus"
-                        )
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(stackMode == .star ? .indigo.gradient : .blue.gradient)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                    }
-
-                    if isLoadingPhotos {
-                        ProgressView("正在加载照片...")
-                    } else if !sourceImages.isEmpty {
-                        Text("已加载 \(sourceImages.count) 张照片")
-                            .foregroundColor(.secondary)
-                    }
-
-                    settingsCard
-
-                    if let error = errorMessage {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundColor(.red)
-                            .multilineTextAlignment(.center)
-                    }
-
-                    Button(action: runStack) {
-                        if isProcessing {
-                            ProgressView(value: progress) {
-                                Text("处理中... \(Int(progress * 100))%")
-                            }
-                            .frame(maxWidth: .infinity)
-                        } else {
-                            Label(stackMode == .star ? "开始 Sigma-Clip 堆栈" : "开始高像素堆栈",
-                                  systemImage: stackMode == .star ? "wand.and.stars" : "sparkle.magnifyingglass")
-                                .frame(maxWidth: .infinity)
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .disabled(sourceImages.isEmpty || isProcessing || isLoadingPhotos)
-
-                    if let result = resultImage {
-                        resultSection(result)
-                    }
-                }
-                .padding()
+                content
             }
             .navigationTitle("StarStacker")
         }
@@ -87,44 +28,100 @@ struct ContentView: View {
         }
     }
 
+    private var content: some View {
+        VStack(spacing: 20) {
+            headerView
+            modePicker
+            photoPickerButton
+            loadingView
+            settingsCard
+            errorView
+            runButton
+            resultSection
+        }
+        .padding()
+    }
+
     private var headerView: some View {
         VStack(spacing: 4) {
-            Image(systemName: stackMode == .star ? "moon.stars.fill" : "camera.metering.multiple")
+            Image(systemName: headerIcon)
                 .font(.system(size: 40))
-                .foregroundColor(stackMode == .star ? .indigo : .blue)
-            Text(stackMode == .star ? "星空像素堆栈" : "高像素堆栈")
+                .foregroundColor(headerColor)
+            Text(headerTitle)
                 .font(.title2.bold())
-            Text(stackMode == .star
-                 ? "Sigma-Clip 降噪 · 星点对齐 · Metal GPU加速"
-                 : "多帧平均降噪 · 锐化增强 · 放大更清晰")
+            Text(headerSubtitle)
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
         .padding(.top)
     }
 
+    private var headerIcon: String {
+        stackMode == .star ? "moon.stars.fill" : "camera.metering.multiple"
+    }
+
+    private var headerColor: Color {
+        stackMode == .star ? .indigo : .blue
+    }
+
+    private var headerTitle: String {
+        stackMode == .star ? "星空像素堆栈" : "高像素堆栈"
+    }
+
+    private var headerSubtitle: String {
+        stackMode == .star
+            ? "Sigma-Clip 降噪 · 星点对齐 · Metal GPU加速"
+            : "多帧平均降噪 · 锐化增强 · 放大更清晰"
+    }
+
+    private var modePicker: some View {
+        Picker("堆栈模式", selection: $stackMode) {
+            ForEach([StackMode.star, .highPixel], id: \.self) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+
+    private var photoPickerTitle: String {
+        stackMode == .star ? "选择星空照片 (最多60张)" : "选择同场景照片 (最多60张)"
+    }
+
+    private var pickerGradient: LinearGradient {
+        stackMode == .star
+            ? LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing)
+            : LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing)
+    }
+
+    private var photoPickerButton: some View {
+        PhotosPicker(selection: $selectedItems, maxSelectionCount: 60, matching: .images) {
+            Label(photoPickerTitle, systemImage: "photo.badge.plus")
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(pickerGradient)
+                .foregroundColor(.white)
+                .cornerRadius(12)
+        }
+    }
+
+    @ViewBuilder
+    private var loadingView: some View {
+        if isLoadingPhotos {
+            ProgressView("正在加载照片...")
+        } else if !sourceImages.isEmpty {
+            Text("已加载 \(sourceImages.count) 张照片")
+                .foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
     private var settingsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             if stackMode == .star {
-                HStack {
-                    Text("Sigma 阈值")
-                    Spacer()
-                    Text(String(format: "%.1fσ", sigmaClipThreshold))
-                        .foregroundColor(.blue)
-                }
-                Slider(value: $sigmaClipThreshold, in: 1.0...5.0, step: 0.5)
-
-                Toggle("启用星点对齐", isOn: $useAlignment)
+                starSettings
             } else {
-                HStack {
-                    Text("帧对齐")
-                    Spacer()
-                    Text("自动")
-                        .foregroundColor(.secondary)
-                }
-                Text("多张同场景照片自动对齐后平均，降噪量 ≈ √N，再叠加 USM 锐化，放大后细节更清晰。")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                highPixelSettings
             }
         }
         .padding()
@@ -132,21 +129,86 @@ struct ContentView: View {
         .cornerRadius(12)
     }
 
-    private func resultSection(_ image: UIImage) -> some View {
-        VStack {
-            Text("堆栈结果")
-                .font(.headline)
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                .frame(maxHeight: 300)
-                .cornerRadius(8)
-                .shadow(radius: 5)
-
-            Button(action: saveToPhotoLibrary) {
-                Label("保存到相册", systemImage: "square.and.arrow.down")
+    private var starSettings: some View {
+        Group {
+            HStack {
+                Text("Sigma 阈值")
+                Spacer()
+                Text(String(format: "%.1fσ", sigmaClipThreshold))
+                    .foregroundColor(.blue)
             }
-            .buttonStyle(.bordered)
+            Slider(value: $sigmaClipThreshold, in: 1.0...5.0, step: 0.5)
+            Toggle("启用星点对齐", isOn: $useAlignment)
+        }
+    }
+
+    private var highPixelSettings: some View {
+        Group {
+            HStack {
+                Text("帧对齐")
+                Spacer()
+                Text("自动")
+                    .foregroundColor(.secondary)
+            }
+            Text("多张同场景照片自动对齐后平均，降噪量 ≈ √N，再叠加 USM 锐化，放大后细节更清晰。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var errorView: some View {
+        if let error = errorMessage {
+            Text(error)
+                .font(.caption)
+                .foregroundColor(.red)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    private var runButtonLabel: String {
+        stackMode == .star ? "开始 Sigma-Clip 堆栈" : "开始高像素堆栈"
+    }
+
+    private var runButtonIcon: String {
+        stackMode == .star ? "wand.and.stars" : "sparkle.magnifyingglass"
+    }
+
+    private var runButton: some View {
+        Button(action: runStack) {
+            if isProcessing {
+                ProgressView(value: progress) {
+                    Text("处理中... \(Int(progress * 100))%")
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                Label(runButtonLabel, systemImage: runButtonIcon)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .disabled(sourceImages.isEmpty || isProcessing || isLoadingPhotos)
+    }
+
+    @ViewBuilder
+    private var resultSection: some View {
+        if let result = resultImage {
+            VStack {
+                Text("堆栈结果")
+                    .font(.headline)
+                Image(uiImage: result)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 300)
+                    .cornerRadius(8)
+                    .shadow(radius: 5)
+
+                Button(action: saveToPhotoLibrary) {
+                    Label("保存到相册", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.bordered)
+            }
         }
     }
 
