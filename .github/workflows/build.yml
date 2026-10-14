@@ -1,0 +1,50 @@
+name: Build StarStacker Unsigned IPA
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Bootstrap directories
+        run: bash scripts/bootstrap.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Show project structure
+        run: find . -name "*.swift" -o -name "*.metal" | head -50
+
+      - name: Archive (no code signing)
+        run: |
+          xcodebuild archive \
+            -project StarStacker.xcodeproj \
+            -scheme StarStacker \
+            -configuration Release \
+            -destination generic/platform=iOS \
+            -archivePath build/StarStacker.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Export unsigned IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/StarStacker.xcarchive \
+            -exportPath build/output \
+            -exportOptionsPlist exportOptions.plist
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarStacker-Unsigned-IPA
+          path: build/output/*.ipa
