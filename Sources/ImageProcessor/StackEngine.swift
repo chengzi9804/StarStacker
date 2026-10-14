@@ -220,7 +220,7 @@ final class StackEngine {
                     defer { ssdData.deallocate() }
                     resultTex.getBytes(
                         ssdData, bytesPerRow: ssdBytesPerRow,
-                        from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: smallW, height: smallH), 0),
+                        from: MTLRegionMake2D(0, 0, smallW, smallH),
                         mipmapLevel: 0
                     )
 
@@ -255,7 +255,7 @@ final class StackEngine {
         let fullData = UnsafeMutableRawPointer.allocate(byteCount: fullBytesPerRow * tex.height, alignment: 16)
         defer { fullData.deallocate() }
         tex.getBytes(fullData, bytesPerRow: fullBytesPerRow,
-                     from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: tex.width, height: tex.height), 0),
+                     from: MTLRegionMake2D(0, 0, tex.width, tex.height),
                      mipmapLevel: 0)
 
         guard let fullCI = CGContext(
@@ -291,7 +291,7 @@ final class StackEngine {
             throw StackError.textureCreationFailed
         }
         smallTex.replace(
-            region: MTLRegionMake2D(CGRect(x: 0, y: 0, width: toWidth, height: height), 0),
+            region: MTLRegionMake2D(0, 0, toWidth, height),
             mipmapLevel: 0,
             withBytes: smallData,
             bytesPerRow: smallBytesPerRow
@@ -328,7 +328,7 @@ final class StackEngine {
             throw StackError.textureCreationFailed
         }
         tex.replace(
-            region: MTLRegionMake2D(CGRect(x: 0, y: 0, width: width, height: height), 0),
+            region: MTLRegionMake2D(0, 0, width, height),
             mipmapLevel: 0,
             withBytes: data,
             bytesPerRow: bytesPerRow
@@ -345,7 +345,7 @@ final class StackEngine {
         defer { data.deallocate() }
 
         tex.getBytes(data, bytesPerRow: bytesPerRow,
-                     from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: width, height: height), 0),
+                     from: MTLRegionMake2D(0, 0, width, height),
                      mipmapLevel: 0)
 
         // Create a self-owning context (data:nil) and draw into it to guarantee copy
