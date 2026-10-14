@@ -15,6 +15,9 @@ final class StackEngine {
     private let commandQueue: MTLCommandQueue
     private let library: MTLLibrary
 
+    /// Downscale factor for alignment search
+    private let alignScale = 8
+
     init() throws {
         guard let dev = MTLCreateSystemDefaultDevice() else {
             throw StackError.deviceNotFound
@@ -42,27 +45,29 @@ final class StackEngine {
         let width = first.width
         let height = first.height
 
-        // Validate all images have matching dimensions
-        for (i, img) in images.enumerated() where img.width != width || img.height != height {
+        for img in images where img.width != width || img.height != height {
             throw StackError.imageSizeMismatch
         }
 
-        // Convert all CGImages to Metal textures
+        // 1. Convert all images to Metal textures
         var textures: [MTLTexture] = []
         for (i, cg) in images.enumerated() {
             let tex = try makeTexture(from: cg)
             textures.append(tex)
-            onProgress(Double(i + 1) / Double(images.count) * 0.25)
+            onProgress(Double(i + 1) / Double(images.count) * 0.2)
         }
 
-        // Compute alignment shifts (brute-force in Metal for speed)
+        // 2. Compute alignment shifts (downscaled for speed)
         var shifts: [SIMD2<Float>] = .init(repeating: .zero, count: textures.count)
         if align && textures.count > 1 {
-            shifts = try await computeShiftsGPU(reference: textures[0], others: Array(textures.dropFirst()))
-            onProgress(0.55)
+            shifts = try await computeShifts(
+                reference: textures[0],
+                others: Array(textures.dropFirst())
+            )
+            onProgress(0.45)
         }
 
-        // Accumulation buffers (float for precision)
+        // 3. Accumulation buffers
         let desc = MTLTextureDescriptor()
         desc.pixelFormat = .rgba32Float
         desc.width = width
@@ -79,7 +84,6 @@ final class StackEngine {
         }
         let accumulatePSO = try device.makeComputePipelineState(function: accumulateFunc)
 
-        // Each frame gets its own command buffer + encoder to avoid binding issues
         for (i, tex) in textures.enumerated() {
             guard let cb = commandQueue.makeCommandBuffer(),
                   let enc = cb.makeComputeCommandEncoder() else {
@@ -103,10 +107,10 @@ final class StackEngine {
             enc.endEncoding()
             cb.commit()
             await cb.waitUntilCompleted()
-            onProgress(0.55 + Double(i + 1) / Double(textures.count) * 0.25)
+            onProgress(0.45 + Double(i + 1) / Double(textures.count) * 0.35)
         }
 
-        // Sigma-clip output pass
+        // 4. Output pass
         guard let sigmaFunc = library.makeFunction(name: "sigmaClipOutput") else {
             throw StackError.shaderNotFound("sigmaClipOutput")
         }
@@ -148,74 +152,151 @@ final class StackEngine {
         }
         onProgress(0.9)
 
-        return try cgImage(from: outTex, width: width, height: height)
+        return try cgImage(from: outTex)
     }
 
-    // MARK: - Alignment via GPU (brute-force SSD in compute shader)
+    // MARK: - Alignment (downscaled brute-force SSD on GPU, parallel threads)
 
-    private func computeShiftsGPU(reference: MTLTexture, others: [MTLTexture]) async throws -> [SIMD2<Float>] {
+    private func computeShifts(reference: MTLTexture, others: [MTLTexture]) async throws -> [SIMD2<Float>] {
+        let smallW = max(1, reference.width / alignScale)
+        let smallH = max(1, reference.height / alignScale)
+
+        let smallRef = try downscaleTexture(reference, toWidth: smallW, height: smallH)
+        var smallOthers: [MTLTexture] = []
+        for other in others {
+            smallOthers.append(try downscaleTexture(other, toWidth: smallW, height: smallH))
+        }
+
         guard let ssdFunc = library.makeFunction(name: "computeSSD") else {
             throw StackError.shaderNotFound("computeSSD")
         }
         let ssdPSO = try device.makeComputePipelineState(function: ssdFunc)
 
-        var shifts: [SIMD2<Float>] = [.zero]
-        let range: Float = 8.0
+        // Result texture for per-pixel SSD (same size as downscaled images)
+        let resultDesc = MTLTextureDescriptor()
+        resultDesc.pixelFormat = .r32Float
+        resultDesc.width = smallW
+        resultDesc.height = smallH
+        resultDesc.usage = [.shaderRead, .shaderWrite]
 
-        for other in others {
+        var shifts: [SIMD2<Float>] = [.zero]
+        let searchRange = 2  // ±2 px on downscaled = ±16 px on full res
+
+        for otherIdx in 0..<smallOthers.count {
+            let smallOther = smallOthers[otherIdx]
             var bestShift = SIMD2<Float>(0, 0)
             var bestSSD: Float = .greatestFiniteMagnitude
 
-            // Search integer shifts in range [-8, 8]
-            for dy in -8...8 {
-                for dx in -8...8 {
+            for dy in -searchRange...searchRange {
+                for dx in -searchRange...searchRange {
                     guard let cb = commandQueue.makeCommandBuffer(),
-                          let enc = cb.makeComputeCommandEncoder() else {
+                          let enc = cb.makeComputeCommandEncoder(),
+                          let resultTex = device.makeTexture(descriptor: resultDesc) else {
                         throw StackError.pipelineCreationFailed
-                    }
-
-                    // 1x1 buffer to receive SSD result
-                    let resultDesc = MTLTextureDescriptor()
-                    resultDesc.pixelFormat = .rgba32Float
-                    resultDesc.width = 1
-                    resultDesc.height = 1
-                    resultDesc.usage = [.shaderRead, .shaderWrite]
-                    guard let resultTex = device.makeTexture(descriptor: resultDesc) else {
-                        throw StackError.textureCreationFailed
                     }
 
                     var shift = SIMD2<Float>(Float(dx), Float(dy))
                     enc.setComputePipelineState(ssdPSO)
-                    enc.setTexture(reference, index: 0)
-                    enc.setTexture(other, index: 1)
+                    enc.setTexture(smallRef, index: 0)
+                    enc.setTexture(smallOther, index: 1)
                     enc.setTexture(resultTex, index: 2)
                     enc.setBytes(&shift, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+
+                    let tgW = ssdPSO.threadExecutionWidth
+                    let tgH = max(1, ssdPSO.maxTotalThreadsPerThreadgroup / tgW)
                     enc.dispatchThreads(
-                        MTLSize(width: 1, height: 1, depth: 1),
-                        threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+                        MTLSize(width: smallW, height: smallH, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1)
                     )
                     enc.endEncoding()
                     cb.commit()
                     await cb.waitUntilCompleted()
 
-                    // Read 1x1 result
-                    var result: Float = 0
+                    // Read per-pixel SSD and average
+                    let ssdBytesPerRow = smallW * 4  // r32Float = 4 bytes per pixel
+                    let ssdData = UnsafeMutableRawPointer.allocate(
+                        byteCount: ssdBytesPerRow * smallH, alignment: 16
+                    )
+                    defer { ssdData.deallocate() }
                     resultTex.getBytes(
-                        &result,
-                        bytesPerRow: 16,
-                        from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: 1, height: 1), 0),
+                        ssdData, bytesPerRow: ssdBytesPerRow,
+                        from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: smallW, height: smallH), 0),
                         mipmapLevel: 0
                     )
 
-                    if result < bestSSD {
-                        bestSSD = result
-                        bestShift = SIMD2<Float>(Float(dx), Float(dy))
+                    var sumSSD: Float = 0
+                    var count: Float = 0
+                    let ptr = ssdData.bindMemory(to: Float.self, capacity: smallW * smallH)
+                    for y in 0..<smallH {
+                        for x in 0..<smallW {
+                            let v = ptr[y * smallW + x]
+                            if v > 0 {
+                                sumSSD += v
+                                count += 1
+                            }
+                        }
+                    }
+                    let avgSSD = count > 0 ? sumSSD / count : .greatestFiniteMagnitude
+
+                    if avgSSD < bestSSD {
+                        bestSSD = avgSSD
+                        bestShift = SIMD2<Float>(Float(dx) * Float(alignScale),
+                                                  Float(dy) * Float(alignScale))
                     }
                 }
             }
             shifts.append(bestShift)
         }
         return shifts
+    }
+
+    private func downscaleTexture(_ tex: MTLTexture, toWidth: Int, height: Int) throws -> MTLTexture {
+        let fullBytesPerRow = tex.width * 4
+        let fullData = UnsafeMutableRawPointer.allocate(byteCount: fullBytesPerRow * tex.height, alignment: 16)
+        defer { fullData.deallocate() }
+        tex.getBytes(fullData, bytesPerRow: fullBytesPerRow,
+                     from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: tex.width, height: tex.height), 0),
+                     mipmapLevel: 0)
+
+        guard let fullCI = CGContext(
+            data: fullData, width: tex.width, height: tex.height,
+            bitsPerComponent: 8, bytesPerRow: fullBytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let fullImg = fullCI.makeImage() else {
+            throw StackError.textureCreationFailed
+        }
+
+        let smallBytesPerRow = toWidth * 4
+        let smallData = UnsafeMutableRawPointer.allocate(byteCount: smallBytesPerRow * height, alignment: 16)
+        defer { smallData.deallocate() }
+
+        guard let smallCI = CGContext(
+            data: smallData, width: toWidth, height: height,
+            bitsPerComponent: 8, bytesPerRow: smallBytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw StackError.textureCreationFailed
+        }
+        smallCI.interpolationQuality = .medium
+        smallCI.draw(fullImg, in: CGRect(x: 0, y: 0, width: toWidth, height: height))
+
+        let desc = MTLTextureDescriptor()
+        desc.pixelFormat = .rgba8Unorm
+        desc.width = toWidth
+        desc.height = height
+        desc.usage = [.shaderRead, .shaderWrite]
+        guard let smallTex = device.makeTexture(descriptor: desc) else {
+            throw StackError.textureCreationFailed
+        }
+        smallTex.replace(
+            region: MTLRegionMake2D(CGRect(x: 0, y: 0, width: toWidth, height: height), 0),
+            mipmapLevel: 0,
+            withBytes: smallData,
+            bytesPerRow: smallBytesPerRow
+        )
+        return smallTex
     }
 
     // MARK: - Texture helpers
@@ -225,16 +306,12 @@ final class StackEngine {
         let height = cg.height
         let bytesPerRow = width * 4
 
-        // Allocate our own buffer so we control lifetime
         let data = UnsafeMutableRawPointer.allocate(byteCount: bytesPerRow * height, alignment: 16)
         defer { data.deallocate() }
 
         guard let ci = CGContext(
-            data: data,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
+            data: data, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
@@ -259,34 +336,42 @@ final class StackEngine {
         return tex
     }
 
-    private func cgImage(from tex: MTLTexture, width: Int, height: Int) throws -> CGImage {
+    private func cgImage(from tex: MTLTexture) throws -> CGImage {
+        let width = tex.width
+        let height = tex.height
         let bytesPerRow = width * 4
-        let totalBytes = bytesPerRow * height
 
-        // Allocate buffer that outlives the function; CGContext will copy it into CGImage
-        let data = UnsafeMutableRawPointer.allocate(byteCount: totalBytes, alignment: 16)
+        let data = UnsafeMutableRawPointer.allocate(byteCount: bytesPerRow * height, alignment: 16)
         defer { data.deallocate() }
 
-        let region = MTLRegionMake2D(CGRect(x: 0, y: 0, width: width, height: height), 0)
-        tex.getBytes(data, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
+        tex.getBytes(data, bytesPerRow: bytesPerRow,
+                     from: MTLRegionMake2D(CGRect(x: 0, y: 0, width: width, height: height), 0),
+                     mipmapLevel: 0)
 
-        guard let ci = CGContext(
-            data: data,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
+        // Create a self-owning context (data:nil) and draw into it to guarantee copy
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let srcContext = CGContext(
+            data: data, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let srcImg = srcContext.makeImage() else {
+            throw StackError.textureCreationFailed
+        }
+
+        guard let dstContext = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             throw StackError.textureCreationFailed
         }
+        dstContext.draw(srcImg, in: CGRect(x: 0, y: 0, width: width, height: height))
 
-        // CGContext.makeImage() copies the bitmap data into a new CGImage,
-        // so the deferred deallocation of `data` after this return is safe.
-        guard let image = ci.makeImage() else {
+        guard let result = dstContext.makeImage() else {
             throw StackError.textureCreationFailed
         }
-        return image
+        return result
     }
 }

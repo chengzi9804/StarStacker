@@ -17,7 +17,7 @@ targets:
     platform: iOS
     sources:
       - path: Sources
-      - path: Assets
+      - path: Assets.xcassets
     info:
       path: Sources/StarStackerApp/Info.plist
       properties:
@@ -35,4 +35,3 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.starstacker.StarStacker
         PRODUCT_NAME: StarStacker
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
