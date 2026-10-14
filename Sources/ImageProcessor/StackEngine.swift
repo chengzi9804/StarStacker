@@ -82,7 +82,7 @@ final class StackEngine {
         guard let accumulateFunc = library.makeFunction(name: "accumulateWithShift") else {
             throw StackError.shaderNotFound("accumulateWithShift")
         }
-        let accumulatePSO = try device.makeComputePipelineState(function: accumulateFunc)
+        let accumulatePSO = try await device.makeComputePipelineState(function: accumulateFunc)
 
         for (i, tex) in textures.enumerated() {
             guard let cb = commandQueue.makeCommandBuffer(),
@@ -114,7 +114,7 @@ final class StackEngine {
         guard let sigmaFunc = library.makeFunction(name: "sigmaClipOutput") else {
             throw StackError.shaderNotFound("sigmaClipOutput")
         }
-        let sigmaPSO = try device.makeComputePipelineState(function: sigmaFunc)
+        let sigmaPSO = try await device.makeComputePipelineState(function: sigmaFunc)
 
         let outDesc = MTLTextureDescriptor()
         outDesc.pixelFormat = .rgba8Unorm
@@ -170,7 +170,7 @@ final class StackEngine {
         guard let ssdFunc = library.makeFunction(name: "computeSSD") else {
             throw StackError.shaderNotFound("computeSSD")
         }
-        let ssdPSO = try device.makeComputePipelineState(function: ssdFunc)
+        let ssdPSO = try await device.makeComputePipelineState(function: ssdFunc)
 
         // Result texture for per-pixel SSD (same size as downscaled images)
         let resultDesc = MTLTextureDescriptor()
