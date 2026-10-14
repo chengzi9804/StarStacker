@@ -1,23 +1,23 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Fixed sampler for bilinear (sub-pixel) sampling
-constexpr sampler bilinear(s_address::clamp_to_zero, t_address::clamp_to_zero,
-                            s_filter::linear, t_filter::linear,
-                            mip_filter::nearest, max_anisotropy::sample_count_1);
+constexpr sampler bilinear(
+    address::clamp_to_zero,
+    filter::linear,
+    mip_filter::nearest
+);
 
 kernel void accumulateWithShift(
     texture2d<float, access::read_write> sumTex [[texture(0)]],
     texture2d<float, access::read_write> sumSqTex [[texture(1)]],
     texture2d<float, access::read_write> countTex [[texture(2)]],
-    texture2d<float, access::read> frameTex [[texture(3)]],
+    texture2d<float> frameTex [[texture(3)]],
     constant float2 &shift [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint w = sumTex.get_width();
     uint h = sumTex.get_height();
 
-    // Sub-pixel sample coordinates (no rounding)
     float sx = float(gid.x) - shift.x;
     float sy = float(gid.y) - shift.y;
 
@@ -25,9 +25,7 @@ kernel void accumulateWithShift(
     float sumSq = sumSqTex.read(gid).r;
     float count = countTex.read(gid).r;
 
-    // Clamp sample region
     if (sx >= 0.0 && sx < float(w) - 1.0 && sy >= 0.0 && sy < float(h) - 1.0) {
-        // Use bilinear sampling for sub-pixel alignment
         float2 texCoord = float2(sx + 0.5, sy + 0.5);
         float4 pix = frameTex.sample(bilinear, texCoord);
         float3 rgb = pix.rgb;
@@ -59,7 +57,6 @@ kernel void sigmaClipOutput(
     }
 
     float3 mean = sum.rgb / count;
-
     float contrast = 1.12;
     float3 result = (mean - 0.5) * contrast + 0.5;
     result = clamp(result, 0.0, 1.0);
@@ -70,10 +67,9 @@ kernel void sigmaClipOutput(
     outTex.write(float4(result, 1.0), gid);
 }
 
-// Parallel SSD with bilinear sampling for sub-pixel alignment search
 kernel void computeSSD(
-    texture2d<float, access::read> refTex [[texture(0)]],
-    texture2d<float, access::read> candTex [[texture(1)]],
+    texture2d<float> refTex [[texture(0)]],
+    texture2d<float> candTex [[texture(1)]],
     texture2d<float, access::write> resultTex [[texture(2)]],
     constant float2 &shift [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
@@ -95,7 +91,6 @@ kernel void computeSSD(
     resultTex.write(localSSD, gid);
 }
 
-// High-pixel mode: clean average output
 kernel void averageOutput(
     texture2d<float, access::read> sumTex [[texture(0)]],
     texture2d<float, access::read> sumSqTex [[texture(1)]],
@@ -113,7 +108,6 @@ kernel void averageOutput(
     outTex.write(float4(mean, 1.0), gid);
 }
 
-// Gentle unsharp mask for high-pixel mode
 kernel void sharpenOutput(
     texture2d<float, access::read> inTex [[texture(0)]],
     texture2d<float, access::write> outTex [[texture(1)]],
