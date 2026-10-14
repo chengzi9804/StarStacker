@@ -2,9 +2,9 @@
 using namespace metal;
 
 kernel void accumulateWithShift(
-    texture2d<float, access::write> sumTex [[texture(0)]],
-    texture2d<float, access::write> sumSqTex [[texture(1)]],
-    texture2d<float, access::write> countTex [[texture(2)]],
+    texture2d<float, access::read_write> sumTex [[texture(0)]],
+    texture2d<float, access::read_write> sumSqTex [[texture(1)]],
+    texture2d<float, access::read_write> countTex [[texture(2)]],
     texture2d<float, access::read> frameTex [[texture(3)]],
     constant float2 &shift [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
