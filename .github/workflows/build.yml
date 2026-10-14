@@ -36,15 +36,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_ENTITLEMENTS=""
 
-      - name: Export unsigned IPA
+      - name: Export unsigned IPA (manual package)
         run: |
-          xcodebuild -exportArchive \
-            -archivePath build/StarStacker.xcarchive \
-            -exportPath build/output \
-            -exportOptionsPlist exportOptions.plist
+          mkdir -p build/output/Payload
+          cp -R build/StarStacker.xcarchive/Products/Applications/StarStacker.app build/output/Payload/
+          cd build/output
+          zip -r StarStacker.ipa Payload
+          ls -la StarStacker.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: StarStacker-Unsigned-IPA
-          path: build/output/*.ipa
+          path: build/output/StarStacker.ipa
